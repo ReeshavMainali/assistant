@@ -1,3 +1,6 @@
+import asyncio
+from pathlib import Path
+
 import ollama
 import requests
 from ddgs import DDGS
@@ -13,6 +16,13 @@ MODELS = {
 DEFAULT_MODEL = "gemma4:e4b"
 
 MAX_TOOL_ROUNDS = 3
+
+# Sandbox root: the tools can never read or write outside this "current directory".
+BASE_DIR = Path(__file__).resolve().parent
+# Default place files are stored.
+WORKSPACE_DIR = BASE_DIR / "workspace"
+# Active storage directory for writes; selectable via the set_directory tool or /dir.
+STORAGE_DIR = WORKSPACE_DIR
 
 WEATHER_CODES = {
     0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
@@ -74,6 +84,60 @@ def get_weather(location: str) -> str:
     )
 
 
+def _check_inside(target: Path, original: str) -> Path:
+    if not target.is_relative_to(BASE_DIR):
+        raise ValueError(f"path '{original}' is outside the current directory")
+    return target
+
+
+def _resolve_read_path(path: str) -> Path:
+    p = Path(path)
+    if p.is_absolute():
+        return _check_inside(p.resolve(), path)
+    # Relative paths are looked up in the storage directory first,
+    # then in the current directory (project root).
+    primary = (STORAGE_DIR / p).resolve()
+    if primary.exists() and primary.is_relative_to(BASE_DIR):
+        return primary
+    return _check_inside((BASE_DIR / p).resolve(), path)
+
+
+def _resolve_write_path(path: str) -> Path:
+    p = Path(path)
+    target = p.resolve() if p.is_absolute() else (STORAGE_DIR / p).resolve()
+    return _check_inside(target, path)
+
+
+def set_directory(path: str) -> str:
+    global STORAGE_DIR
+    p = Path(path)
+    target = p.resolve() if p.is_absolute() else (BASE_DIR / p).resolve()
+    _check_inside(target, path)
+    target.mkdir(parents=True, exist_ok=True)
+    STORAGE_DIR = target
+    return f"storage directory set to {STORAGE_DIR}"
+
+
+def read_file(path: str) -> str:
+    target = _resolve_read_path(path)
+    if not target.exists():
+        return f"error: no file found at '{path}'"
+    if target.is_dir():
+        entries = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
+        return "that is a directory; contents:\n" + "\n".join(entries)
+    try:
+        return target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"error: '{path}' is not a text file"
+
+
+def write_file(path: str, content: str) -> str:
+    target = _resolve_write_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"wrote {len(content)} characters to '{target}'"
+
+
 TOOLS = [
     {
         "type": "function",
@@ -113,9 +177,86 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read a text file. Relative paths are looked up in the "
+                "storage directory first, then in the current directory "
+                "(project root). If given a directory, it lists its "
+                "contents instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to the workspace, e.g. 'notes/todo.txt'",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write (create or overwrite) a text file. Paths are "
+                "relative to the current storage directory (the workspace "
+                "by default) and cannot go outside the current directory. "
+                "Missing parent folders are created automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to the storage directory, e.g. 'notes/todo.txt'",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full text content to write to the file",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_directory",
+            "description": (
+                "Change the storage directory used by write_file (and "
+                "looked up first by read_file). Paths are relative to the "
+                "current directory (project root) and cannot go outside "
+                "it. Use '.' for the current directory itself. The default "
+                "is 'workspace'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path relative to the current directory, e.g. 'docs' or '.'",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
-TOOL_FUNCTIONS = {"web_search": web_search, "get_weather": get_weather}
+TOOL_FUNCTIONS = {
+    "web_search": web_search,
+    "get_weather": get_weather,
+    "read_file": read_file,
+    "write_file": write_file,
+    "set_directory": set_directory,
+}
 
 
 class ChatApp(App):
@@ -172,6 +313,34 @@ class ChatApp(App):
 
     def on_mount(self) -> None:
         self.query_one("#prompt", Input).focus()
+        WORKSPACE_DIR.mkdir(exist_ok=True)
+        self.write_line(f"storage directory: {STORAGE_DIR} (root: {BASE_DIR})", "system")
+        self.fetch_models()
+
+    @work(exclusive=True)
+    async def fetch_models(self) -> None:
+        try:
+            res = await self.client.list()
+            model_names = []
+            if hasattr(res, "models"):
+                for m in res.models:
+                    name = getattr(m, "model", None)
+                    if name:
+                        model_names.append(name)
+            elif isinstance(res, dict):
+                for m in res.get("models", []):
+                    name = m.get("model") if isinstance(m, dict) else getattr(m, "model", None)
+                    if name:
+                        model_names.append(name)
+
+            if model_names:
+                select = self.query_one("#model-select", Select)
+                select.set_options([(n, n) for n in model_names])
+                if self.model not in model_names:
+                    self.model = model_names[0]
+                    select.value = self.model
+        except Exception:
+            pass
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "model-select":
@@ -199,6 +368,27 @@ class ChatApp(App):
         if text == "/clear":
             self.action_clear_chat()
             return
+        if text.startswith("/save"):
+            parts = text.split(maxsplit=1)
+            filename = parts[1] if len(parts) > 1 else "chat_history.json"
+            self.action_save_chat(filename)
+            return
+        if text.startswith("/load"):
+            parts = text.split(maxsplit=1)
+            filename = parts[1] if len(parts) > 1 else "chat_history.json"
+            self.action_load_chat(filename)
+            return
+        if text == "/dir" or text.startswith("/dir "):
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1:
+                try:
+                    message = set_directory(parts[1])
+                except Exception as e:
+                    message = f"error: {e}"
+            else:
+                message = f"storage directory: {STORAGE_DIR} (root: {BASE_DIR})"
+            self.write_line(message, "system")
+            return
 
         self.write_line(f"you> {text}", "user")
         self.messages.append({"role": "user", "content": text})
@@ -212,6 +402,46 @@ class ChatApp(App):
         self.messages = []
         self.query_one("#chat", VerticalScroll).remove_children()
         self.write_line("context cleared", "system")
+
+    def action_save_chat(self, filename: str = "chat_history.json") -> None:
+        import json
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(self.messages, f, ensure_ascii=False, indent=2)
+            self.write_line(f"chat saved to {filename}", "system")
+        except Exception as e:
+            self.write_line(f"error saving chat: {e}", "system")
+
+    def action_load_chat(self, filename: str = "chat_history.json") -> None:
+        import json
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.messages = data
+                scroll = self.query_one("#chat", VerticalScroll)
+                scroll.remove_children()
+                for msg in self.messages:
+                    role = msg.get("role")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        self.write_line(f"you> {content}", "user")
+                    elif role == "assistant":
+                        if content:
+                            self.write_line(f"{self.model}>", "assistant-header")
+                            self.write_markdown(content)
+                        if msg.get("tool_calls"):
+                            for call in msg["tool_calls"]:
+                                name = call["function"]["name"]
+                                args = call["function"]["arguments"]
+                                self.write_line(f"→ calling {name}({args})", "system")
+                    elif role == "tool":
+                        self.write_line(f"[tool result]: {content}", "system")
+                self.write_line(f"chat loaded from {filename}", "system")
+            else:
+                self.write_line("error: invalid chat file format", "system")
+        except Exception as e:
+            self.write_line(f"error loading chat: {e}", "system")
 
     @work(exclusive=True)
     async def stream_reply(self) -> None:
@@ -264,10 +494,35 @@ class ChatApp(App):
                 if func is None:
                     result = f"error: no such tool '{name}'"
                 else:
-                    try:
-                        result = func(**args)
-                    except Exception as e:
-                        result = f"error running {name}: {e}"
+                    if not isinstance(args, dict):
+                        args = {}
+                    
+                    validation_error = None
+                    if name == "web_search":
+                        if not args.get("query"):
+                            validation_error = "error: 'query' argument is required for web_search"
+                    elif name == "get_weather":
+                        if not args.get("location"):
+                            validation_error = "error: 'location' argument is required for get_weather"
+                    elif name == "read_file":
+                        if not args.get("path"):
+                            validation_error = "error: 'path' argument is required for read_file"
+                    elif name == "write_file":
+                        if not args.get("path"):
+                            validation_error = "error: 'path' argument is required for write_file"
+                        elif args.get("content") is None:
+                            validation_error = "error: 'content' argument is required for write_file"
+                    elif name == "set_directory":
+                        if not args.get("path"):
+                            validation_error = "error: 'path' argument is required for set_directory"
+
+                    if validation_error:
+                        result = validation_error
+                    else:
+                        try:
+                            result = await asyncio.to_thread(func, **args)
+                        except Exception as e:
+                            result = f"error running {name}: {e}"
 
                 self.messages.append(
                     {"role": "tool", "content": result, "name": name}
